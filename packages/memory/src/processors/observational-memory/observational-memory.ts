@@ -11,8 +11,10 @@ import type { RequestContext } from '@mastra/core/request-context';
 import type { MemoryStorage, ObservationalMemoryRecord, ObservationalMemoryHistoryOptions } from '@mastra/core/storage';
 import xxhash from 'xxhash-wasm';
 
+import type { Memory } from '../..';
 import { resolveActivationTTL } from './activation-ttl';
 import { BufferingCoordinator } from './buffering-coordinator';
+import { composeObservationExtractors, composeReflectionExtractors } from './built-in-extractors';
 import {
   OBSERVATIONAL_MEMORY_DEFAULTS,
   OBSERVATION_CONTEXT_PROMPT,
@@ -188,6 +190,11 @@ function parseActivationTTL(
 
 import { addRelativeTimeToObservations } from './date-utils';
 import { omDebug, omError } from './debug';
+import {
+  buildExtractedValueContextSections,
+  buildThreadMetadataFromExtractedValues,
+  getPriorExtractedValues,
+} from './extracted-values';
 import { createBufferingStartMarker, createActivationMarker } from './markers';
 import {
   findLastCompletedObservationBoundary,
@@ -300,6 +307,7 @@ export class ObservationalMemory {
   private shouldObscureThreadIds = false;
   private hasher = xxhash();
   private mastra?: Mastra;
+  private memory?: Memory;
 
   /**
    * Track message IDs observed during this instance's lifetime.
@@ -381,6 +389,7 @@ export class ObservationalMemory {
     this.retrieval = Boolean(config.retrieval);
     this.onIndexObservations = config.onIndexObservations;
     this.mastra = config.mastra;
+    this.memory = config.memory;
 
     // Resolve "default" to the model default for the agent being configured.
     const resolveModel = (model: ObservationalMemoryModel | undefined, defaultModel: string) =>
@@ -505,6 +514,10 @@ export class ObservationalMemory {
       instruction: config.observation?.instruction,
       threadTitle: config.observation?.threadTitle ?? false,
       observeAttachments: config.observation?.observeAttachments ?? true,
+      extractors: composeObservationExtractors({
+        threadTitle: config.observation?.threadTitle ?? false,
+        extract: config.observation?.extract,
+      }),
     };
 
     // Resolve reflection config with defaults
@@ -536,6 +549,7 @@ export class ObservationalMemory {
             config.reflection?.observationTokens ?? OBSERVATIONAL_MEMORY_DEFAULTS.reflection.observationTokens,
           ),
       instruction: config.reflection?.instruction,
+      extractors: composeReflectionExtractors({ extract: config.reflection?.extract }),
     };
 
     this.tokenCounter = new TokenCounter({
@@ -554,6 +568,7 @@ export class ObservationalMemory {
       resolveModel: inputTokens => this.resolveObservationModel(inputTokens),
       tokenCounter: this.tokenCounter,
       mastra: config.mastra,
+      memory: this.memory,
     });
 
     this.buffering = new BufferingCoordinator({
@@ -575,6 +590,7 @@ export class ObservationalMemory {
       getCompressionStartLevel: rc => this.getCompressionStartLevel(rc),
       resolveModel: inputTokens => this.resolveReflectionModel(inputTokens),
       mastra: config.mastra,
+      memory: this.memory,
     });
 
     // Validate buffer configuration
@@ -1570,6 +1586,7 @@ export class ObservationalMemory {
     observations: string,
     currentTask?: string,
     suggestedResponse?: string,
+    extractedValues?: Record<string, unknown>,
     unobservedContextBlocks?: string,
     currentDate?: Date,
     retrieval = false,
@@ -1608,6 +1625,13 @@ export class ObservationalMemory {
     if (suggestedResponse) {
       messages.push(`<suggested-response>\n${suggestedResponse}\n</suggested-response>`);
     }
+
+    messages.push(
+      ...buildExtractedValueContextSections(
+        [...this.observationConfig.extractors, ...this.reflectionConfig.extractors],
+        extractedValues,
+      ),
+    );
 
     return messages;
   }
@@ -2497,6 +2521,7 @@ ${formattedMessages}
       record.activeObservations,
       currentTask,
       suggestedResponse,
+      omMetadata?.extracted,
       unobservedContextBlocks,
       currentDate,
       this.retrieval,
@@ -2899,6 +2924,7 @@ ${formattedMessages}
      *  before lastBufferedBoundary is set. */
     record?: ObservationalMemoryRecord;
     writer?: ProcessorStreamWriter;
+    agent?: ProcessorContext['agent'];
     sendSignal?: ProcessorContext['sendSignal'];
     requestContext?: RequestContext;
     currentModel?: ObservationModelContext;
@@ -3053,6 +3079,7 @@ ${formattedMessages}
         cycleId,
         startedAt,
         writer,
+        agent: opts.agent,
         sendSignal: opts.sendSignal,
         requestContext,
         currentModel: opts.currentModel,
@@ -3361,6 +3388,7 @@ ${formattedMessages}
     resourceId?: string;
     messages?: MastraDBMessage[];
     hooks?: ObserveHooks;
+    agent?: ProcessorContext['agent'];
     requestContext?: RequestContext;
     writer?: ProcessorStreamWriter;
     observabilityContext?: ObservabilityContext;
@@ -3409,6 +3437,7 @@ ${formattedMessages}
           resourceId,
           messages: unobservedMessages,
           reflectionHooks,
+          agent: opts.agent,
           requestContext,
           writer: opts.writer,
           observabilityContext: opts.observabilityContext,
@@ -3461,6 +3490,9 @@ ${formattedMessages}
     registerOp(record.id, 'reflecting');
 
     try {
+      const thread = await this.storage.getThreadById({ threadId });
+      const previousOmMetadata = getThreadOMMetadata(thread?.metadata);
+      const priorExtractedValues = getPriorExtractedValues(previousOmMetadata);
       const reflectThreshold = getMaxThreshold(this.getEffectiveReflectionTokens(record));
       const reflectResult = await this.reflector.call(
         record.activeObservations,
@@ -3471,6 +3503,7 @@ ${formattedMessages}
         undefined,
         undefined,
         requestContext,
+        priorExtractedValues,
         observabilityContext,
         undefined,
       );
@@ -3482,8 +3515,21 @@ ${formattedMessages}
         tokenCount: reflectionTokenCount,
       });
 
-      // Note: Thread metadata (currentTask, suggestedResponse) is preserved on each thread
-      // and doesn't need to be updated during reflection - it was set during observation
+      if (thread && reflectResult.extractedValues) {
+        const metadataUpdate = buildThreadMetadataFromExtractedValues(reflectResult.extractedValues);
+        const newMetadata = setThreadOMMetadata(thread.metadata, {
+          currentTask: metadataUpdate.currentTask ?? previousOmMetadata?.currentTask,
+          suggestedResponse: metadataUpdate.suggestedResponse ?? previousOmMetadata?.suggestedResponse,
+          threadTitle: metadataUpdate.threadTitle ?? previousOmMetadata?.threadTitle,
+          extracted: { ...(previousOmMetadata?.extracted ?? {}), ...(metadataUpdate.extracted ?? {}) },
+        });
+        await this.storage.updateThread({
+          id: threadId,
+          title: thread.title ?? '',
+          metadata: newMetadata,
+        });
+      }
+
       const updatedRecord = await this.getOrCreateRecord(threadId, resourceId);
       return { reflected: true, record: updatedRecord, usage: reflectResult.usage };
     } catch (error) {
@@ -3579,6 +3625,13 @@ ${formattedMessages}
   }
 
   /**
+   * Get the owning Memory instance when available.
+   */
+  getMemory(): Memory | undefined {
+    return this.memory;
+  }
+
+  /**
    * Get the token counter
    */
   getTokenCounter(): TokenCounter {
@@ -3633,6 +3686,7 @@ ${formattedMessages}
     threadId: string;
     resourceId?: string;
     messageList: MessageList;
+    agent?: ProcessorContext['agent'];
     observabilityContext?: ObservabilityContext;
     hooks?: ObservationTurnHooks;
   }): ObservationTurn {
@@ -3641,6 +3695,7 @@ ${formattedMessages}
       threadId: opts.threadId,
       resourceId: opts.resourceId,
       messageList: opts.messageList,
+      agent: opts.agent,
       observabilityContext: opts.observabilityContext,
       hooks: opts.hooks,
     });
